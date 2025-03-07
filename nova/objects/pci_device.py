@@ -181,6 +181,8 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
                 #       hypervisor
                 #     - "live_migratable": true/false if the device can be live
                 #       migratable
+                #     - "one_time_use": true/false if the device should only
+                #       be allocated once
                 extra_info = self.extra_info
                 data = v if isinstance(v, str) else jsonutils.dumps(v)
                 extra_info.update({k: data})
@@ -190,7 +192,7 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
         # As in the above case, we must explicitly assign to self.extra_info
         # so that obj_what_changed detects the modification and triggers
         # a save later.
-        tags_to_clean = ["managed", "live_migratable"]
+        tags_to_clean = ["managed", "live_migratable", "one_time_use"]
         for tag in tags_to_clean:
             if tag not in dev_dict and tag in self.extra_info:
                 extra_info = self.extra_info
