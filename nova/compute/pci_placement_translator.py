@@ -18,6 +18,7 @@ import typing as ty
 import os_resource_classes
 import os_traits
 from oslo_log import log as logging
+from oslo_utils import strutils
 from oslo_utils import uuidutils
 
 from nova.compute import provider_tree
@@ -170,6 +171,12 @@ class PciResourceProvider:
                     dev.address for dev in self.children_devs),
             )
 
+        if 'one_time_use' in dev.extra_info:
+            # Child devices cannot be OTU. Do not even tolerate setting =false
+            raise exception.PlacementPciException(
+                error=('Only type-PCI and type-PF devices may set '
+                       'one_time_use and %s does not qualify') % self.name)
+
         self.children_devs.append(dev)
         self.resource_class = rc
         self.traits = traits
@@ -215,6 +222,37 @@ class PciResourceProvider:
             ]
         )
 
+    def handle_one_time_use(self, inventory: dict):
+        # Both of these have to be set in order for us to ever get here.
+        # But, mypy needs a lot of convincing, so we'll put this in the runtime
+        # code just to make it happy :(
+        dev: pci_device.PciDevice = self.parent_dev
+        traits: set = self.traits or set()  # This can never happen
+
+        is_allocated = 'instance_uuid' in dev and dev.instance_uuid
+        is_otu = strutils.bool_from_string(dev.extra_info.get(
+            'one_time_use', 'false'))
+        if is_otu and is_allocated:
+            # If we are an allocated parent device, and our one-time-use flag
+            # is set, we need to also set our inventory to reserved.
+            # NOTE(danms): VERY IMPORTANT: we never *ever* want to update
+            # reserved to anything other than len(self.devs), and definitely
+            # not if we are not allocated. These devices are intended to go
+            # from unallocated to allocated AND reserved. They may be
+            # unreserved by an external entity, but never nova.
+            if inventory.get('reserved', 0) == 0:
+                LOG.info('Setting reserved=%i for one-time-use '
+                         'resource provider %s',
+                         len(self.devs), self.name)
+            inventory['reserved'] = len(self.devs)
+
+        if is_otu:
+            # We always decorate OTU providers with a trait so they can be
+            # easily found
+            traits.add('HW_PCI_ONE_TIME_USE')
+        else:
+            traits.discard('HW_PCI_ONE_TIME_USE')
+
     def update_provider_tree(
         self,
         provider_tree: provider_tree.ProviderTree,
@@ -243,27 +281,33 @@ class PciResourceProvider:
                 uuid=uuidutils.generate_uuid(dashed=True)
             )
 
+        rp_uuid = provider_tree.data(self.name).uuid
+        inventory = {
+            "total": len(self.devs),
+            "max_unit": len(self.devs),
+        }
+
+        if self.parent_dev:
+            # Only top-level devices are candidates for one-time-use management
+            self.handle_one_time_use(inventory)
+
         provider_tree.update_inventory(
             self.name,
-            # NOTE(gibi): The rest of the inventory fields (reserved,
-            # allocation_ratio, etc.) are defaulted by placement and the
-            # default value make sense for PCI devices, i.e. no overallocation
-            # and PCI can be allocated one by one.
-            # Also, this way if the operator sets reserved value in placement
-            # for the PCI inventories directly then nova will not override that
-            # value periodically.
+            # NOTE(gibi): The rest of the inventory fields (allocation_ratio,
+            # etc.) are defaulted by placement and the default value makes
+            # sense for PCI devices, i.e. no overallocation and PCI can be
+            # allocated one by one. We may set the reserved value to a nonzero
+            # amount on the provider if the operator requests it via the
+            # one_time_use=true flag, but otherwise the operator controls
+            # reserved and nova will not override that value periodically.
             {
-                self.resource_class: {
-                    "total": len(self.devs),
-                    "max_unit": len(self.devs),
-                }
+                self.resource_class: inventory
             },
         )
         provider_tree.update_traits(self.name, self.traits)
 
         # Here we are sure the RP exists in the provider_tree. So, we can
         # record the RP UUID in each PciDevice this RP represents
-        rp_uuid = provider_tree.data(self.name).uuid
         for dev in self.devs:
             dev.extra_info['rp_uuid'] = rp_uuid
 
